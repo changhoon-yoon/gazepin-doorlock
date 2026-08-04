@@ -134,9 +134,10 @@ def put_center(canvas, text, cx, y, scale=0.6, color=TXT, thick=1, font=cv2.FONT
 
 
 def draw_entry_board(canvas, left_syms, right_syms, live, flash, armed, center_frames):
-    """Reading zone = two tight vertical columns at the center (read by scanning
-    vertically, which is not an input axis). Command zone = big arrow targets at
-    the screen edges. Selection only arms after a short center fixation."""
+    """Digits sit in a FIXED central grid (position never changes, like a keypad,
+    so finding your digit is instant). What re-randomizes every round is only the
+    side badge on each tile (< blue / > orange) — i.e. the partition rendering.
+    Command zone = big arrow targets at the screen edges; a center glance arms."""
     # edge command targets
     for side, x0, x1, acx in (("LEFT", 40, 170, 105), ("RIGHT", 790, 920, 855)):
         fl = (flash == side)
@@ -146,15 +147,21 @@ def draw_entry_board(canvas, left_syms, right_syms, live, flash, armed, center_f
         cv2.rectangle(canvas, (x0, 160), (x1, 430), border, 3 if live == side else 1)
         put_center(canvas, "<" if side == "LEFT" else ">", acx, 315, 3.0, ACCENT[side], 6,
                    cv2.FONT_HERSHEY_DUPLEX)
-    # central reading columns
-    for syms, cx, side in ((left_syms, 400, "LEFT"), (right_syms, 560, "RIGHT")):
-        cv2.rectangle(canvas, (cx - 58, 150), (cx + 58, 445), PANEL, -1)
-        cv2.rectangle(canvas, (cx - 58, 150), (cx + 58, 445),
-                      tuple(int(c * 0.6) for c in ACCENT[side]), 1)
-        put_center(canvas, "<" if side == "LEFT" else ">", cx, 178, 0.55, ACCENT[side], 1)
-        for i, s in enumerate(sorted(syms)):
-            put_center(canvas, s, cx, 235 + i * 60, 1.5, DIGIT_COLORS[s], 3, cv2.FONT_HERSHEY_DUPLEX)
-    # arming dot between the columns
+    # fixed central digit grid: 2 cols x 4 rows, row-major 1..8, positions permanent
+    for i, s in enumerate(SYMBOLS):
+        cx = 415 if i % 2 == 0 else 545
+        yc = 205 + (i // 2) * 67
+        side = "LEFT" if s in left_syms else "RIGHT"
+        tint = tuple(int(p * 0.72 + a * 0.28) for p, a in zip(PANEL, ACCENT[side]))
+        cv2.rectangle(canvas, (cx - 42, yc - 27), (cx + 42, yc + 27), tint, -1)
+        cv2.rectangle(canvas, (cx - 42, yc - 27), (cx + 42, yc + 27), ACCENT[side], 1)
+        if side == "LEFT":
+            put_center(canvas, "<", cx - 24, yc + 10, 0.9, ACCENT[side], 2, cv2.FONT_HERSHEY_DUPLEX)
+            put_center(canvas, s, cx + 10, yc + 12, 1.1, DIGIT_COLORS[s], 3, cv2.FONT_HERSHEY_DUPLEX)
+        else:
+            put_center(canvas, s, cx - 10, yc + 12, 1.1, DIGIT_COLORS[s], 3, cv2.FONT_HERSHEY_DUPLEX)
+            put_center(canvas, ">", cx + 24, yc + 10, 0.9, ACCENT[side], 2, cv2.FONT_HERSHEY_DUPLEX)
+    # arming dot between the grid columns
     dot = (480, 305)
     if armed:
         cv2.circle(canvas, dot, 9, OK_COLOR, -1)
