@@ -1,0 +1,47 @@
+name: build-demos
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [headpin]
+    paths: ["**.py", "requirements-demo.txt", ".github/workflows/build.yml"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: GazePinDoorlock-windows
+          - os: macos-latest
+            artifact: GazePinDoorlock-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements-demo.txt pyinstaller
+
+      - name: Fetch gaze model weights
+        shell: bash
+        run: |
+          mkdir -p weights
+          curl -L -o weights/mobileone_s0_gaze.onnx \
+            https://github.com/yakhyo/gaze-estimation/releases/download/weights/mobileone_s0_gaze.onnx
+
+      - name: Build
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --onedir --console --name GazePinDoorlock \
+            --collect-all mediapipe --collect-all uniface launcher.py
+          cp -r weights models README_TEAM.md dist/GazePinDoorlock/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/GazePinDoorlock

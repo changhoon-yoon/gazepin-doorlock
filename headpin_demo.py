@@ -432,12 +432,23 @@ def main():
                 cv2.rectangle(canvas, (W // 2 - 120, 380),
                               (W // 2 - 120 + int(240 * frac), 394), gp.OK_COLOR, -1)
         elif app == "CALIB":
-            cv2.circle(canvas, (W // 2, 300), 14, gp.ACCENT["LEFT"], -1)
-            cv2.circle(canvas, (W // 2, 300), 22, gp.ACCENT["LEFT"], 2)
-            gp.put_center(canvas, "DO NOT MOVE - look at the dot", W // 2, 380, 0.85, gp.TXT, 2,
+            ex, ey = W // 2, 290
+            accent = gp.ACCENT["LEFT"]
+            # rings converging onto the eye -> pulls the gaze inward
+            phase = (now * 1.1) % 1.0
+            ring_r = int(95 - 60 * phase)
+            ring_col = tuple(int(c * (0.25 + 0.75 * phase)) for c in accent)
+            cv2.circle(canvas, (ex, ey), ring_r, ring_col, 2)
+            # eye icon: almond outline + iris + pupil (pupil dilates with progress)
+            prog = min(1.0, calib_frames / CALIB_FRAMES)
+            cv2.ellipse(canvas, (ex, ey), (50, 28), 0, 0, 360, gp.TXT, 2)
+            cv2.circle(canvas, (ex, ey), 16, accent, -1)
+            cv2.circle(canvas, (ex, ey), 6 + int(5 * prog), (25, 25, 25), -1)
+            cv2.circle(canvas, (ex - 5, ey - 5), 2, (245, 245, 245), -1)
+            gp.put_center(canvas, "LOOK HERE", ex, ey + 68, 0.7, accent, 2, cv2.FONT_HERSHEY_DUPLEX)
+            gp.put_center(canvas, "DO NOT MOVE", W // 2, 400, 0.85, gp.TXT, 2,
                           cv2.FONT_HERSHEY_DUPLEX)
-            gp.put_center(canvas, f"calibrating {min(100, int(100 * calib_frames / CALIB_FRAMES))}%",
-                          W // 2, 420, 0.7, gp.DIM, 2)
+            gp.put_center(canvas, f"calibrating {int(100 * prog)}%", W // 2, 435, 0.7, gp.DIM, 2)
         elif app == "CONFIRM":
             gp.put_center(canvas, "PIN OK - Open the door?", W // 2, 160, 1.1, gp.TXT, 2,
                           cv2.FONT_HERSHEY_DUPLEX)

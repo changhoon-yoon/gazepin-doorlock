@@ -3,6 +3,20 @@
 시선(또는 고개 제스처)만으로 비밀번호를 입력하는 어깨너머 방어 도어락 프로토타입.
 개인 프로젝트(2026-08)로 만든 프로토타입. 설계 근거와 보안 분석은 `doorlock_pin_design.md` 참고.
 
+## 초보자용: 실행 파일로 바로 쓰기 (Python 설치 불필요)
+
+GitHub 저장소의 **Actions → build-demos → 최신 실행 → Artifacts**에서 받기:
+- `GazePinDoorlock-windows` — 압축 해제 후 `GazePinDoorlock.exe` 더블클릭
+- `GazePinDoorlock-macos-arm64` (Apple Silicon) — 압축 해제 후 터미널에서:
+  ```
+  xattr -cr GazePinDoorlock   # 다운로드 차단(Gatekeeper) 해제
+  ./GazePinDoorlock/GazePinDoorlock
+  ```
+  첫 실행 시 카메라 권한을 허용해야 합니다.
+
+실행하면 콘솔에서 데모(1=HeadPIN 고개, 2=GazePIN 시선)와 PIN을 고른 뒤 시작됩니다.
+첫 실행은 얼굴검출 모델을 자동 다운로드하므로 인터넷 연결이 필요합니다.
+
 ## 준비물
 - Windows + 웹캠
 - **Python 3.11** (mediapipe 호환 범위: 3.9~3.12. 3.13은 안 됨) — [python.org](https://www.python.org/downloads/)에서 설치
