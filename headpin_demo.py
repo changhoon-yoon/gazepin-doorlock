@@ -358,6 +358,17 @@ def main():
     active_rounds = ROUNDS
     mask_low, mask_up, mask_bhat = [], [], []
     mask_patches = None
+    avatar_on = args.avatar
+    AV_BTN = (W - 185, 56, W - 30, 88)  # on-screen avatar toggle button
+
+    def on_mouse(event, mx, my, flags, param):
+        nonlocal avatar_on
+        if (event == cv2.EVENT_LBUTTONDOWN
+                and AV_BTN[0] <= mx <= AV_BTN[2] and AV_BTN[1] <= my <= AV_BTN[3]):
+            avatar_on = not avatar_on
+
+    cv2.namedWindow("HeadPIN Door Lock")
+    cv2.setMouseCallback("HeadPIN Door Lock", on_mouse)
     state, cand, cand_n = "CENTER", None, 0
     prev_state = "CENTER"
     armed = False
@@ -378,7 +389,7 @@ def main():
         now = time.time()
         st = tracker.update(frame)
         view = cv2.flip(frame, 1)
-        if st.ok and st.bbox and not args.avatar:
+        if st.ok and st.bbox and not avatar_on:
             cv2.rectangle(view, st.bbox[:2], st.bbox[2:], gp.OK_COLOR, 1)
 
         # debounced state (directions outside the active set are ignored,
@@ -618,6 +629,12 @@ def main():
         canvas = np.full((H, W, 3), bg, np.uint8)
         gp.put(canvas, "HeadPIN 4-way Door Lock", (30, 45), 0.9, gp.TXT, 2, cv2.FONT_HERSHEY_DUPLEX)
         gp.put(canvas, f"attempts {attempts}/{MAX_ATTEMPTS}", (W - 180, 45), 0.55, gp.DIM)
+        # avatar toggle button (clickable)
+        btn_col = gp.OK_COLOR if avatar_on else (110, 110, 110)
+        cv2.rectangle(canvas, AV_BTN[:2], AV_BTN[2:], gp.PANEL, -1)
+        cv2.rectangle(canvas, AV_BTN[:2], AV_BTN[2:], btn_col, 2)
+        gp.put_center(canvas, f"AVATAR {'ON' if avatar_on else 'OFF'}",
+                      (AV_BTN[0] + AV_BTN[2]) // 2, AV_BTN[1] + 22, 0.55, btn_col, 2)
 
         if app == "WAIT":
             gp.put_center(canvas, "Stand in front of the door", W // 2, 290, 1.1, gp.TXT, 2,
@@ -746,10 +763,11 @@ def main():
 
         if now < info_until:
             gp.put_center(canvas, info, W // 2, 615, 0.6, (80, 200, 255), 2)
-        gp.put(canvas, "c=recalibrate  r=restart  x=flip-yaw  q=quit", (300, H - 20), 0.5, gp.DIM)
+        gp.put(canvas, f"c=recalibrate  r=restart  x=flip-yaw  a=avatar[{'ON' if avatar_on else 'off'}]  q=quit",
+               (300, H - 20), 0.5, gp.DIM)
 
         # avatar is applied only now, AFTER mask-detection sampled real colors
-        if args.avatar and st.ok and st.landmarks is not None:
+        if avatar_on and st.ok and st.landmarks is not None:
             draw_avatar(view, st.landmarks, st.bbox, st)
         inset = cv2.resize(view, (240, 180))
         canvas[H - 200:H - 20, W - 260:W - 20] = inset
@@ -767,6 +785,8 @@ def main():
         elif k == ord('x'):
             tracker.flip_yaw()
             print("[yaw sign flipped]")
+        elif k == ord('a'):
+            avatar_on = not avatar_on
         elif k == ord('r') and app == "ENTER":
             entry = PinEntry4(active_dirs, active_rounds)
             pending_at = None
