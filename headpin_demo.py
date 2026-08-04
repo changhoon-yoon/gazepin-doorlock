@@ -30,6 +30,13 @@ LOCKOUT_S = 30.0
 INACTIVITY_S = 25.0
 FINAL_CHECK_DELAY = 1.4
 LONG_BLINK_FRAMES = 15   # ~0.5s of closed eyes = cancel current digit
+# presence-gated calibration: calibrate only after the visitor stands still
+MIN_FACE_FRAC = 0.14     # face width >= 14% of frame width = close enough
+STAND_FRAMES = 25        # ~0.8s of stable presence required
+STABLE_TOL = 0.02        # bbox-center wander tolerance (fraction of frame width)
+JUMP_TOL = 0.012         # per-frame movement that restarts calibration
+CALIB_FRAMES = 18
+FACE_LOST_RESET_S = 2.0  # visitor gone this long during entry -> session reset
 
 DIR_COLORS = {
     "LEFT": (80, 200, 255),   # orange
@@ -38,6 +45,10 @@ DIR_COLORS = {
     "DOWN": (235, 120, 200),  # violet
 }
 DIR_GLYPH = {"LEFT": "<", "RIGHT": ">", "UP": "^", "DOWN": "v"}
+
+# whole-canvas background per PIN digit stage (1st..4th) so the current
+# position is always obvious at a glance
+STAGE_BGS = [(52, 34, 22), (24, 46, 26), (46, 28, 46), (24, 42, 54)]
 
 KEYPAD = [["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], [None, "0", None]]
 KEY_CX = {0: 400, 1: 480, 2: 560}
@@ -147,11 +158,12 @@ def draw_board(canvas, entry, live, flash, armed):
                 continue
             cx, yc = KEY_CX[cidx], KEY_YC[r]
             d = entry.vectors[s][-1] if entry.vectors[s] else "LEFT"
-            tint = tuple(int(p * 0.72 + a * 0.28) for p, a in zip(gp.PANEL, DIR_COLORS[d]))
-            cv2.rectangle(canvas, (cx - 36, yc - 27), (cx + 36, yc + 27), tint, -1)
-            cv2.rectangle(canvas, (cx - 36, yc - 27), (cx + 36, yc + 27), DIR_COLORS[d], 1)
+            # uniform tiles/digits: direction is carried by the arrow color only
+            cv2.rectangle(canvas, (cx - 36, yc - 27), (cx + 36, yc + 27), gp.PANEL, -1)
+            cv2.rectangle(canvas, (cx - 36, yc - 27), (cx + 36, yc + 27), (95, 95, 95), 1)
             gp.put_center(canvas, s, cx - 6, yc + 12, 1.0, gp.TXT, 2, cv2.FONT_HERSHEY_DUPLEX)
-            gp.put_center(canvas, DIR_GLYPH[d], cx + 22, yc - 8, 0.55, DIR_COLORS[d], 2)
+            gp.put_center(canvas, DIR_GLYPH[d], cx + 22, yc - 6, 0.7, DIR_COLORS[d], 2,
+                          cv2.FONT_HERSHEY_DUPLEX)
 
 
 def main():
@@ -171,9 +183,14 @@ def main():
     cap = cv2.VideoCapture(args.source)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+    from collections import deque
     W, H = gp.CANVAS_W, gp.CANVAS_H
-    app = "CALIB"
+    app = "WAIT"
     calib_frames = 0
+    centers = deque(maxlen=STAND_FRAMES)
+    grace_until = 0.0
+    face_lost_at = None
+    wait_close = False
     state, cand, cand_n = "CENTER", None, 0
     prev_state = "CENTER"
     armed = False
@@ -220,19 +237,68 @@ def main():
             closed_frames = 0
             blink_latched = False
 
+        # presence tracking (normalized bbox center + face size)
+        nface = 0.0
+        if st.ok and st.bbox:
+            fw = view.shape[1]
+            centers.append(((st.bbox[0] + st.bbox[2]) / 2 / fw,
+                            (st.bbox[1] + st.bbox[3]) / 2 / fw))
+            nface = st.face_px / fw
+        else:
+            centers.clear()
+
+        # visitor left mid-entry -> reset the session for the next person
+        if app == "ENTER":
+            if not st.ok:
+                if face_lost_at is None:
+                    face_lost_at = now
+                elif now - face_lost_at > FACE_LOST_RESET_S:
+                    app = "WAIT"
+                    centers.clear()
+                    tracker.reset_calibration()
+                    entry = PinEntry4()
+                    armed = False
+                    pending_at = None
+                    face_lost_at = None
+                    info, info_until = "Visitor left - session reset", now + 2.5
+                    print("[presence] face lost - session reset")
+            else:
+                face_lost_at = None
+
         # ---- app state machine ----
-        if app == "CALIB":
-            if st.ok:
-                calib_frames += 1
-            if calib_frames >= 15 and tracker.calibrate():
-                entry = PinEntry4()
-                attempts = 0
-                armed = False
-                state = "CENTER"
-                last_event = now
-                app = "ENTER"
-                g.beep(800, 120)
-                print("[calibrated] neutral head pose locked")
+        if app == "WAIT":
+            wait_close = st.ok and nface >= MIN_FACE_FRAC
+            stable = (len(centers) == centers.maxlen
+                      and max(c[0] for c in centers) - min(c[0] for c in centers) < STABLE_TOL
+                      and max(c[1] for c in centers) - min(c[1] for c in centers) < STABLE_TOL)
+            if wait_close and stable:
+                app = "CALIB"
+                calib_frames = 0
+                grace_until = now + 0.6
+                g.beep(600, 80)
+                print("[presence] visitor standing still - starting calibration")
+
+        elif app == "CALIB":
+            if not st.ok:
+                app = "WAIT"
+                centers.clear()
+            else:
+                moved = (len(centers) >= 2
+                         and (abs(centers[-1][0] - centers[-2][0]) > JUMP_TOL
+                              or abs(centers[-1][1] - centers[-2][1]) > JUMP_TOL))
+                if moved:
+                    calib_frames = 0
+                elif now >= grace_until:
+                    calib_frames += 1
+                if calib_frames >= CALIB_FRAMES and tracker.calibrate():
+                    entry = PinEntry4()
+                    attempts = 0
+                    armed = False
+                    state = "CENTER"
+                    last_event = now
+                    app = "ENTER"
+                    g.beep(800, 120)
+                    print("[calibrated] neutral head pose locked")
 
         elif app == "ENTER":
             if state == "CENTER" and pending_at is None:
@@ -313,17 +379,33 @@ def main():
         prev_state = state
 
         # ---- draw ----
-        canvas = np.full((H, W, 3), gp.BG, np.uint8)
+        bg = gp.BG
+        if app in ("ENTER", "FAIL") and entry is not None:
+            bg = STAGE_BGS[min(entry.symbol_idx, PIN_LEN - 1)]
+        canvas = np.full((H, W, 3), bg, np.uint8)
         gp.put(canvas, "HeadPIN 4-way Door Lock", (30, 45), 0.9, gp.TXT, 2, cv2.FONT_HERSHEY_DUPLEX)
         gp.put(canvas, f"attempts {attempts}/{MAX_ATTEMPTS}", (W - 180, 45), 0.55, gp.DIM)
 
-        if app == "CALIB":
+        if app == "WAIT":
+            gp.put_center(canvas, "Stand in front of the door", W // 2, 290, 1.1, gp.TXT, 2,
+                          cv2.FONT_HERSHEY_DUPLEX)
+            if not st.ok:
+                gp.put_center(canvas, "waiting for a visitor...", W // 2, 350, 0.7, gp.DIM, 2)
+            elif not wait_close:
+                gp.put_center(canvas, "Come closer", W // 2, 350, 0.8, gp.ACCENT["LEFT"], 2)
+            else:
+                frac = len(centers) / centers.maxlen
+                gp.put_center(canvas, "Hold still...", W // 2, 350, 0.8, gp.OK_COLOR, 2)
+                cv2.rectangle(canvas, (W // 2 - 120, 380), (W // 2 + 120, 394), (70, 70, 70), 1)
+                cv2.rectangle(canvas, (W // 2 - 120, 380),
+                              (W // 2 - 120 + int(240 * frac), 394), gp.OK_COLOR, -1)
+        elif app == "CALIB":
             cv2.circle(canvas, (W // 2, 300), 14, gp.ACCENT["LEFT"], -1)
             cv2.circle(canvas, (W // 2, 300), 22, gp.ACCENT["LEFT"], 2)
-            gp.put_center(canvas, "Face the camera squarely to calibrate", W // 2, 380, 0.8, gp.TXT, 2)
-            gp.put_center(canvas, f"{min(100, int(100 * calib_frames / 15))}%", W // 2, 420, 0.7, gp.DIM, 2)
-            if not st.ok:
-                gp.put_center(canvas, "NO FACE DETECTED", W // 2, 470, 0.7, gp.BAD_COLOR, 2)
+            gp.put_center(canvas, "DO NOT MOVE - look at the dot", W // 2, 380, 0.85, gp.TXT, 2,
+                          cv2.FONT_HERSHEY_DUPLEX)
+            gp.put_center(canvas, f"calibrating {min(100, int(100 * calib_frames / CALIB_FRAMES))}%",
+                          W // 2, 420, 0.7, gp.DIM, 2)
         elif app == "SUCCESS":
             cv2.rectangle(canvas, (0, 90), (W, H), (35, 70, 35), -1)
             gp.put_center(canvas, "UNLOCKED", W // 2, 320, 2.6, gp.OK_COLOR, 6, cv2.FONT_HERSHEY_DUPLEX)
@@ -389,8 +471,9 @@ def main():
         if k == ord('q'):
             break
         elif k == ord('c'):
-            app = "CALIB"
+            app = "WAIT"
             calib_frames = 0
+            centers.clear()
             tracker.reset_calibration()
         elif k == ord('x'):
             tracker.flip_yaw()
