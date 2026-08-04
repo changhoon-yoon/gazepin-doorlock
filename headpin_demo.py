@@ -12,6 +12,7 @@
 # Usage: python headpin_demo.py [--pin 1234] [--source 0]
 # Keys : c = recalibrate, r = restart entry, x = flip yaw sign, q = quit
 import argparse
+import math
 import random
 import time
 import cv2
@@ -54,6 +55,24 @@ DIR_COLORS = {
     "DOWN": (235, 120, 200),  # violet
 }
 DIR_GLYPH = {"LEFT": "<", "RIGHT": ">", "UP": "^", "DOWN": "v"}
+
+
+def draw_arrow(canvas, d, cx, cy, s, color):
+    """Filled triangle arrow — consistent size for all four directions
+    (the '^' text glyph renders tiny in Hershey fonts)."""
+    if d == "LEFT":
+        p = [(cx - s, cy), (cx + int(s * 0.7), cy - int(s * 0.8)),
+             (cx + int(s * 0.7), cy + int(s * 0.8))]
+    elif d == "RIGHT":
+        p = [(cx + s, cy), (cx - int(s * 0.7), cy - int(s * 0.8)),
+             (cx - int(s * 0.7), cy + int(s * 0.8))]
+    elif d == "UP":
+        p = [(cx, cy - s), (cx - int(s * 0.8), cy + int(s * 0.7)),
+             (cx + int(s * 0.8), cy + int(s * 0.7))]
+    else:  # DOWN
+        p = [(cx, cy + s), (cx - int(s * 0.8), cy - int(s * 0.7)),
+             (cx + int(s * 0.8), cy - int(s * 0.7))]
+    cv2.fillPoly(canvas, [np.array(p, np.int32)], color)
 
 # whole-canvas background per PIN digit stage (1st..4th) so the current
 # position is always obvious at a glance
@@ -149,12 +168,12 @@ def draw_board(canvas, entry, live, flash, armed, dirs=None):
     dirs = dirs or DIRECTIONS
     # edge targets
     tgt = {
-        "LEFT": ((40, 160), (170, 430), (105, 310), 3.0),
-        "RIGHT": ((790, 160), (920, 430), (855, 310), 3.0),
-        "UP": ((330, 128), (630, 160), (480, 153), 1.1),
-        "DOWN": ((330, 430), (630, 462), (480, 456), 1.1),
+        "LEFT": ((40, 160), (170, 430), (105, 295), 30),
+        "RIGHT": ((790, 160), (920, 430), (855, 295), 30),
+        "UP": ((330, 118), (630, 164), (480, 141), 17),
+        "DOWN": ((330, 428), (630, 474), (480, 451), 17),
     }
-    for d, (p0, p1, tp, sc) in tgt.items():
+    for d, (p0, p1, tp, sz) in tgt.items():
         if d not in dirs:
             continue
         fl = (flash == d)
@@ -162,8 +181,7 @@ def draw_board(canvas, entry, live, flash, armed, dirs=None):
         cv2.rectangle(canvas, p0, p1, fill, -1)
         border = DIR_COLORS[d] if (live == d or fl) else (85, 85, 85)
         cv2.rectangle(canvas, p0, p1, border, 3 if live == d else 1)
-        gp.put_center(canvas, DIR_GLYPH[d], tp[0], tp[1], sc, DIR_COLORS[d],
-                      4 if sc > 2 else 2, cv2.FONT_HERSHEY_DUPLEX)
+        draw_arrow(canvas, d, tp[0], tp[1], sz, DIR_COLORS[d])
     # keypad frame doubles as the arming indicator
     cv2.rectangle(canvas, (350, 168), (610, 423), gp.OK_COLOR if armed else (85, 85, 85),
                   2 if armed else 1)
@@ -178,8 +196,96 @@ def draw_board(canvas, entry, live, flash, armed, dirs=None):
             cv2.rectangle(canvas, (cx - 36, yc - 27), (cx + 36, yc + 27), gp.PANEL, -1)
             cv2.rectangle(canvas, (cx - 36, yc - 27), (cx + 36, yc + 27), (95, 95, 95), 1)
             gp.put_center(canvas, s, cx - 6, yc + 12, 1.0, gp.TXT, 2, cv2.FONT_HERSHEY_DUPLEX)
-            gp.put_center(canvas, DIR_GLYPH[d], cx + 22, yc - 6, 0.7, DIR_COLORS[d], 2,
-                          cv2.FONT_HERSHEY_DUPLEX)
+            draw_arrow(canvas, d, cx + 23, yc - 12, 9, DIR_COLORS[d])
+
+
+# landmark/pose-driven cartoon CAT avatar for demo videos (--avatar):
+# anonymizes the face while head turns, blinks and mouth stay visible.
+# Pure drawing, ~1-2ms.
+def draw_avatar(img, lms, bbox, st=None):
+    h, w = img.shape[:2]
+    xs = [lm.x for lm in lms]
+    ys = [lm.y for lm in lms]
+    cx, cy = int(np.mean(xs) * w), int(np.mean(ys) * h)
+    fw = max((max(xs) - min(xs)) * w, 1.0)
+    R = int(fw * 0.80)
+
+    # pixelate an enlarged face box first (hides hair/ears/chin)
+    if bbox:
+        x0, y0, x1, y1 = bbox
+        bw, bh = x1 - x0, y1 - y0
+        x0 = max(0, x0 - bw // 3); y0 = max(0, y0 - bh // 2)
+        x1 = min(w, x1 + bw // 3); y1 = min(h, y1 + bh // 4)
+        roi = img[y0:y1, x0:x1]
+        if roi.size:
+            small = cv2.resize(roi, (12, 12), interpolation=cv2.INTER_LINEAR)
+            img[y0:y1, x0:x1] = cv2.resize(small, (x1 - x0, y1 - y0),
+                                           interpolation=cv2.INTER_NEAREST)
+
+    yaw = st.yaw if st else 0.0
+    pitch = st.pitch if st else 0.0
+    dx = int(-np.clip(yaw, -25, 25) * R * 0.016)   # feature parallax with pose
+    dy = int(-np.clip(pitch, -25, 25) * R * 0.016)
+    pl, pr = lms[33], lms[263]
+    roll = math.atan2((pr.y - pl.y) * h, (pr.x - pl.x) * w)
+    ca, sa = math.cos(roll), math.sin(roll)
+
+    def rot(px, py, ox=0, oy=0):
+        return (int(cx + ox + px * ca - py * sa), int(cy + oy + px * sa + py * ca))
+
+    HEAD = (90, 190, 255)   # warm orange
+    DARK = (55, 95, 150)
+    PINK = (150, 130, 250)
+    # ears
+    for sx in (-1, 1):
+        outer = np.array([rot(sx * R * 0.78, -R * 0.50), rot(sx * R * 0.25, -R * 0.90),
+                          rot(sx * R * 0.82, -R * 1.22)])
+        cv2.fillPoly(img, [outer], HEAD)
+        cv2.polylines(img, [outer], True, DARK, 3)
+        inner = np.array([rot(sx * R * 0.65, -R * 0.66), rot(sx * R * 0.42, -R * 0.86),
+                          rot(sx * R * 0.68, -R * 1.02)])
+        cv2.fillPoly(img, [inner], PINK)
+    # head
+    cv2.circle(img, (cx, cy), R, HEAD, -1)
+    cv2.circle(img, (cx, cy), R, DARK, 3)
+    # big eyes (blink-aware) with pose-following pupils
+    eye_off, eye_r = R * 0.36, int(R * 0.22)
+    closed = st is not None and st.blink_score > 0.35
+    for sx in (-1, 1):
+        ex, ey = rot(sx * eye_off, -R * 0.08, dx, dy)
+        if closed:
+            cv2.ellipse(img, (ex, ey), (eye_r, int(eye_r * 0.55)),
+                        math.degrees(roll), 20, 160, (40, 40, 40), 4)
+        else:
+            cv2.circle(img, (ex, ey), eye_r, (255, 255, 255), -1)
+            cv2.circle(img, (ex, ey), eye_r, DARK, 2)
+            px_, py_ = ex + dx // 2, ey + dy // 2
+            cv2.circle(img, (px_, py_), int(eye_r * 0.52), (45, 40, 40), -1)
+            cv2.circle(img, (px_ - eye_r // 4, py_ - eye_r // 4),
+                       max(2, eye_r // 5), (255, 255, 255), -1)
+    # blush
+    for sx in (-1, 1):
+        cv2.circle(img, rot(sx * R * 0.58, R * 0.30, dx // 2, dy // 2),
+                   int(R * 0.13), (170, 160, 255), -1)
+    # nose + omega mouth (opens with the real mouth)
+    nose = np.array([rot(-R * 0.07, R * 0.16, dx, dy), rot(R * 0.07, R * 0.16, dx, dy),
+                     rot(0, R * 0.27, dx, dy)])
+    cv2.fillPoly(img, [nose], PINK)
+    open_amt = abs(lms[14].y - lms[13].y) * h / fw
+    if open_amt > 0.06:
+        mx, my_ = rot(0, R * 0.48, dx, dy)
+        cv2.ellipse(img, (mx, my_), (int(R * 0.15), int(R * 0.18)),
+                    math.degrees(roll), 0, 360, (60, 60, 160), -1)
+    else:
+        for sx in (-1, 1):
+            mx, my_ = rot(sx * R * 0.10, R * 0.38, dx, dy)
+            cv2.ellipse(img, (mx, my_), (int(R * 0.10), int(R * 0.08)),
+                        math.degrees(roll), 20, 160, DARK, 3)
+    # whiskers
+    for sx in (-1, 1):
+        for wy in (-0.02, 0.10):
+            cv2.line(img, rot(sx * R * 0.55, R * (0.22 + wy), dx // 2, dy // 2),
+                     rot(sx * R * 1.02, R * (0.16 + wy * 2), dx // 2, dy // 2), DARK, 2)
 
 
 def _region_hist(img, x0, y0, x1, y1):
@@ -222,6 +328,11 @@ def main():
     ap.add_argument("--pin", default="1234")
     ap.add_argument("--source", type=int, default=0)
     ap.add_argument("--model", default="models/face_landmarker.task")
+    ap.add_argument("--avatar", action="store_true",
+                    help="anonymize the camera view with a landmark-driven cartoon face")
+    ap.add_argument("--mask-detect", action="store_true",
+                    help="EXPERIMENTAL: auto-switch to 3-way mode when a mask is detected "
+                         "(current color heuristic is lighting-sensitive, off by default)")
     args = ap.parse_args()
     pin = args.pin
     if len(pin) != PIN_LEN or any(ch not in SYMBOLS for ch in pin):
@@ -267,7 +378,7 @@ def main():
         now = time.time()
         st = tracker.update(frame)
         view = cv2.flip(frame, 1)
-        if st.ok and st.bbox:
+        if st.ok and st.bbox and not args.avatar:
             cv2.rectangle(view, st.bbox[:2], st.bbox[2:], gp.OK_COLOR, 1)
 
         # debounced state (directions outside the active set are ignored,
@@ -370,8 +481,9 @@ def main():
                         ratio = jl / max(ju, 1e-6)
                     if mask_bhat:
                         bhat = float(np.median(mask_bhat))
-                    # landmark-anchored mean-color distance is the sole signal
-                    masked = bhat > MASK_COLOR_DIST
+                    # landmark-anchored mean-color distance is the sole signal;
+                    # opt-in only: hue is unstable at low saturation/lighting
+                    masked = args.mask_detect and bhat > MASK_COLOR_DIST
                     active_dirs = list(MASKED_DIRS) if masked else list(DIRECTIONS)
                     active_rounds = MASKED_ROUNDS if masked else ROUNDS
                     print(f"[mask] jitter_ratio={ratio:.2f} color_dist={bhat:.1f} -> "
@@ -636,6 +748,9 @@ def main():
             gp.put_center(canvas, info, W // 2, 615, 0.6, (80, 200, 255), 2)
         gp.put(canvas, "c=recalibrate  r=restart  x=flip-yaw  q=quit", (300, H - 20), 0.5, gp.DIM)
 
+        # avatar is applied only now, AFTER mask-detection sampled real colors
+        if args.avatar and st.ok and st.landmarks is not None:
+            draw_avatar(view, st.landmarks, st.bbox, st)
         inset = cv2.resize(view, (240, 180))
         canvas[H - 200:H - 20, W - 260:W - 20] = inset
         cv2.rectangle(canvas, (W - 260, H - 200), (W - 20, H - 20), (90, 90, 90), 1)
