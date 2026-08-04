@@ -165,7 +165,9 @@ def main():
         raise SystemExit(f"PIN must be {PIN_LEN} digits 0-9, got: {pin}")
     print(f"[HeadPIN-4way] demo PIN = {pin} (console only, never shown on screen)")
 
-    tracker = HeadTracker(args.model)
+    # up/down thresholds raised well above the natural head tilt of reading the
+    # on-screen keypad (session log showed DOWN false-firing while reading)
+    tracker = HeadTracker(args.model, thr_deg=12.0, up_thr_deg=13.0, down_thr_deg=17.0)
     cap = cv2.VideoCapture(args.source)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
