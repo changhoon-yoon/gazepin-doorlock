@@ -466,18 +466,31 @@ def main():
             gp.put_center(canvas, "LOCKED OUT", W // 2, 320, 2.2, gp.BAD_COLOR, 5, cv2.FONT_HERSHEY_DUPLEX)
             gp.put_center(canvas, f"try again in {int(until - now) + 1}s", W // 2, 400, 0.9, gp.TXT, 2)
         else:
+            # PIN slots: the current slot is split into ROUNDS half-cells and
+            # fills one half per head turn — "2 turns complete 1 digit" is
+            # conveyed by the structure itself, no round counter needed
+            slot_w, slot_h = 62, 56
             for i in range(PIN_LEN):
-                cx = W // 2 - 90 + i * 60
+                x0 = W // 2 - 156 + i * 80
+                y0 = 58
                 if i < entry.symbol_idx:
-                    cv2.circle(canvas, (cx, 85), 12, gp.OK_COLOR, -1)
+                    cv2.rectangle(canvas, (x0, y0), (x0 + slot_w, y0 + slot_h), gp.PANEL, -1)
+                    cv2.rectangle(canvas, (x0, y0), (x0 + slot_w, y0 + slot_h), gp.OK_COLOR, 2)
+                    gp.put_center(canvas, "*", x0 + slot_w // 2, y0 + 45, 1.4, gp.OK_COLOR, 3,
+                                  cv2.FONT_HERSHEY_DUPLEX)
+                elif i == entry.symbol_idx:
+                    for k in range(ROUNDS):
+                        hx0 = x0 + k * (slot_w // ROUNDS)
+                        filled = k < entry.round_idx
+                        cv2.rectangle(canvas, (hx0 + 3, y0 + 3),
+                                      (hx0 + slot_w // ROUNDS - 3, y0 + slot_h - 3),
+                                      gp.OK_COLOR if filled else gp.PANEL, -1)
+                    cv2.rectangle(canvas, (x0, y0), (x0 + slot_w, y0 + slot_h), gp.TXT, 2)
                 else:
-                    cv2.circle(canvas, (cx, 85), 12, gp.DIM, 2)
-                    if i == entry.symbol_idx:
-                        cv2.circle(canvas, (cx, 85), 15, gp.TXT, 1)
-            for r in range(ROUNDS):
-                cx = W // 2 - 15 + r * 30
-                col = gp.OK_COLOR if r < entry.round_idx else gp.DIM
-                cv2.circle(canvas, (cx, 113), 6, col, -1 if r < entry.round_idx else 1)
+                    cv2.rectangle(canvas, (x0, y0), (x0 + slot_w, y0 + slot_h), gp.PANEL, -1)
+                    cv2.rectangle(canvas, (x0, y0), (x0 + slot_w, y0 + slot_h), (85, 85, 85), 1)
+            gp.put(canvas, "2 turns", (W // 2 + 180, 82), 0.5, gp.DIM, 1)
+            gp.put(canvas, "= 1 digit", (W // 2 + 180, 104), 0.5, gp.DIM, 1)
 
             live = state if state in DIRECTIONS else None
             fl = flash_side if now < flash_until else None
@@ -486,13 +499,11 @@ def main():
             if entry.symbol_idx >= PIN_LEN:
                 gp.put_center(canvas, "Verifying...  (long blink cancels the last digit)",
                               W // 2, 490, 0.6, gp.TXT, 1)
+            elif armed:
+                gp.put_center(canvas, "turn your head toward your digit's arrow  |  long blink = redo digit",
+                              W // 2, 490, 0.58, gp.OK_COLOR, 1)
             else:
-                step = f"Digit {entry.symbol_idx + 1}/{PIN_LEN}  round {entry.round_idx + 1}/{ROUNDS}  -  "
-                if armed:
-                    gp.put_center(canvas, step + "turn your head toward your digit's arrow  |  long blink = redo digit",
-                                  W // 2, 490, 0.58, gp.OK_COLOR, 1)
-                else:
-                    gp.put_center(canvas, step + "face forward to arm", W // 2, 490, 0.58, gp.TXT, 1)
+                gp.put_center(canvas, "face forward to arm", W // 2, 490, 0.58, gp.TXT, 1)
 
         # 2D head joystick pad
         if st.ok and app in ("ENTER", "FAIL", "CONFIRM"):
