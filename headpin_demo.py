@@ -248,7 +248,7 @@ def main():
             centers.clear()
 
         # visitor left mid-entry -> reset the session for the next person
-        if app == "ENTER":
+        if app in ("ENTER", "CONFIRM"):
             if not st.ok:
                 if face_lost_at is None:
                     face_lost_at = now
@@ -336,10 +336,11 @@ def main():
             if pending_at is not None and now >= pending_at:
                 pending_at = None
                 if "".join(entry.entered) == pin:
-                    app = "SUCCESS"
-                    until = now + 4.0
-                    g.beep(1400, 350)
-                    print("[UNLOCKED]")
+                    app = "CONFIRM"
+                    until = now + 10.0
+                    armed = False
+                    g.beep(1100, 150)
+                    print("[PIN OK] asking whether to open the door")
                 else:
                     attempts += 1
                     print(f"[wrong PIN] attempt {attempts}/{MAX_ATTEMPTS}")
@@ -357,10 +358,41 @@ def main():
                 last_event = now
                 g.beep(300, 150)
 
-        elif app in ("SUCCESS", "FAIL"):
+        elif app == "CONFIRM":
+            if state == "CENTER":
+                armed = True
+            if armed and prev_state == "CENTER" and state in ("LEFT", "RIGHT"):
+                armed = False
+                flash_side, flash_until = state, now + 0.35
+                if state == "RIGHT":
+                    app = "SUCCESS"
+                    until = now + 4.0
+                    g.beep(1400, 350)
+                    print("[door opened]")
+                else:
+                    app = "DECLINED"
+                    until = now + 2.5
+                    g.beep(400, 250)
+                    print("[declined] door stays locked")
+            elif now >= until:
+                app = "DECLINED"
+                until = now + 2.5
+                g.beep(400, 250)
+                print("[confirm timeout] door stays locked")
+
+        elif app in ("SUCCESS", "DECLINED"):
             if now >= until:
-                if app == "SUCCESS":
-                    attempts = 0
+                attempts = 0
+                entry = PinEntry4()
+                armed = False
+                pending_at = None
+                centers.clear()
+                tracker.reset_calibration()
+                last_event = now
+                app = "WAIT"
+
+        elif app == "FAIL":
+            if now >= until:
                 entry = PinEntry4()
                 armed = False
                 pending_at = None
@@ -406,6 +438,25 @@ def main():
                           cv2.FONT_HERSHEY_DUPLEX)
             gp.put_center(canvas, f"calibrating {min(100, int(100 * calib_frames / CALIB_FRAMES))}%",
                           W // 2, 420, 0.7, gp.DIM, 2)
+        elif app == "CONFIRM":
+            gp.put_center(canvas, "PIN OK - Open the door?", W // 2, 160, 1.1, gp.TXT, 2,
+                          cv2.FONT_HERSHEY_DUPLEX)
+            for side, x0, x1, label, col in (("LEFT", 120, 420, "< NO", gp.BAD_COLOR),
+                                             ("RIGHT", 540, 840, "YES >", gp.OK_COLOR)):
+                live_s = (state == side)
+                fl = (flash_side == side and now < flash_until)
+                cv2.rectangle(canvas, (x0, 220), (x1, 420), gp.PANEL, -1)
+                cv2.rectangle(canvas, (x0, 220), (x1, 420),
+                              col if (live_s or fl) else (95, 95, 95), 4 if live_s else 1)
+                gp.put_center(canvas, label, (x0 + x1) // 2, 335, 1.6, col, 4, cv2.FONT_HERSHEY_DUPLEX)
+            hint = "turn your head:  LEFT = no   RIGHT = yes" if armed else "face forward first"
+            gp.put_center(canvas, hint, W // 2, 470, 0.65, gp.OK_COLOR if armed else gp.TXT, 1)
+            gp.put_center(canvas, f"auto-cancel in {max(0, int(until - now) + 1)}s",
+                          W // 2, 505, 0.55, gp.DIM, 1)
+        elif app == "DECLINED":
+            cv2.rectangle(canvas, (0, 90), (W, H), (40, 40, 48), -1)
+            gp.put_center(canvas, "Door stays locked", W // 2, 320, 1.6, gp.TXT, 3,
+                          cv2.FONT_HERSHEY_DUPLEX)
         elif app == "SUCCESS":
             cv2.rectangle(canvas, (0, 90), (W, H), (35, 70, 35), -1)
             gp.put_center(canvas, "UNLOCKED", W // 2, 320, 2.6, gp.OK_COLOR, 6, cv2.FONT_HERSHEY_DUPLEX)
@@ -444,7 +495,7 @@ def main():
                     gp.put_center(canvas, step + "face forward to arm", W // 2, 490, 0.58, gp.TXT, 1)
 
         # 2D head joystick pad
-        if st.ok and app in ("ENTER", "FAIL"):
+        if st.ok and app in ("ENTER", "FAIL", "CONFIRM"):
             px0, py0, sz = 80, 495, 150
             cv2.rectangle(canvas, (px0, py0), (px0 + sz, py0 + sz), (70, 70, 70), 1)
             cv2.line(canvas, (px0 + sz // 2, py0), (px0 + sz // 2, py0 + sz), (55, 55, 55), 1)
