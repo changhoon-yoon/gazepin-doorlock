@@ -146,7 +146,7 @@ if __name__ == "__main__":
         faces = detector.detect(frame)
 
         for face in faces:
-            bbox = face.bbox
+            bbox = face["bbox"] if isinstance(face, dict) else face.bbox
             x_min, y_min, x_max, y_max = map(int, bbox[:4])
             face_crop = frame[y_min:y_max, x_min:x_max]
             if face_crop.size == 0:

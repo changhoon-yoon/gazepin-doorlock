@@ -1,28 +1,19 @@
 import cv2
 import numpy as np
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from torchvision import transforms
-
-from utils.datasets import Gaze360, MPIIGaze
-
-from models import (
-    resnet18,
-    resnet34,
-    resnet50,
-    mobilenet_v2,
-    mobileone_s0,
-    mobileone_s1,
-    mobileone_s2,
-    mobileone_s3,
-    mobileone_s4,
-)
-
-
 def get_model(arch, bins, pretrained=False, inference_mode=False):
     """Return the model based on the specified architecture."""
+    from models import (
+        resnet18,
+        resnet34,
+        resnet50,
+        mobilenet_v2,
+        mobileone_s0,
+        mobileone_s1,
+        mobileone_s2,
+        mobileone_s3,
+        mobileone_s4,
+    )
     if arch == "resnet18":
         model = resnet18(pretrained=pretrained, num_classes=bins)
     elif arch == "resnet34":
@@ -66,6 +57,9 @@ def gaze_to_3d(yaw: float, pitch: float) -> np.ndarray:
 
 def get_dataloader(params, mode="train"):
     """Load dataset and return DataLoader."""
+    from torch.utils.data import DataLoader
+    from torchvision import transforms
+    from utils.datasets import Gaze360, MPIIGaze
 
     transform = transforms.Compose(
         [
