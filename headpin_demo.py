@@ -1,19 +1,157 @@
-# HeadPIN door-unlock demo — the same GazePIN protocol, driven by HEAD TURNS.
-# Sensing engine: HeadTracker (MediaPipe FaceLandmarker), copied from the
-# head-gesture-doorlock project. Protocol + UI are imported from gazepin_demo,
-# so the two variants stay directly comparable.
+# HeadPIN 4-way door-unlock demo
+# Base-4 GazePIN protocol driven by head turns (LEFT/RIGHT/UP/DOWN).
+# - Real 0-9 PIN (10^4 keyspace), 2 rounds/digit -> 8 gestures per 4-digit PIN.
+# - Digits sit on a FIXED phone-style keypad; only each tile's direction badge
+#   (arrow + tint) re-randomizes every round. Partitions are generated from
+#   public state only - the PIN is never an input to layout generation.
+# - LONG BLINK (~0.5s) cancels the CURRENT DIGIT's rounds and restarts that
+#   digit with fresh partitions (during final verification it cancels the last
+#   digit instead). Only 10 of the 16 possible answer pairs are valid, so many
+#   input errors are self-detected and the digit auto-restarts.
 #
 # Usage: python headpin_demo.py [--pin 1234] [--source 0]
-# Keys : c = recalibrate neutral pose, r = restart entry, x = flip yaw sign, q = quit
+# Keys : c = recalibrate, r = restart entry, x = flip yaw sign, q = quit
 import argparse
+import random
 import time
 import cv2
 import numpy as np
 from headtracker import HeadTracker
 import lr_gaze_fast as g   # beep
-import gazepin_demo as gp  # PIN protocol + shared UI
+import gazepin_demo as gp  # shared drawing helpers / colors / canvas size
 
-DEBOUNCE_N = 3  # frames a new head direction must persist
+SYMBOLS = [str(i) for i in range(10)]
+DIRECTIONS = ["LEFT", "RIGHT", "UP", "DOWN"]
+ROUNDS = 2               # ceil(log4(10))
+PIN_LEN = 4
+DEBOUNCE_N = 3
+MAX_ATTEMPTS = 3
+LOCKOUT_S = 30.0
+INACTIVITY_S = 25.0
+FINAL_CHECK_DELAY = 1.4
+LONG_BLINK_FRAMES = 15   # ~0.5s of closed eyes = cancel current digit
+
+DIR_COLORS = {
+    "LEFT": (80, 200, 255),   # orange
+    "RIGHT": (255, 200, 80),  # light blue
+    "UP": (110, 220, 110),    # green
+    "DOWN": (235, 120, 200),  # violet
+}
+DIR_GLYPH = {"LEFT": "<", "RIGHT": ">", "UP": "^", "DOWN": "v"}
+
+KEYPAD = [["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], [None, "0", None]]
+KEY_CX = {0: 400, 1: 480, 2: 560}
+KEY_YC = [200, 263, 326, 389]
+
+
+def make_partition(cells):
+    """Assign every symbol to one of 4 directions; split each cell as evenly as
+    possible, balancing group sizes. Uses only public state + randomness."""
+    groups = {d: set() for d in DIRECTIONS}
+    order = cells[:]
+    random.shuffle(order)
+    for cell in order:
+        c = list(cell)
+        random.shuffle(c)
+        s = len(c)
+        base, rem = divmod(s, 4)
+        sizes = [base + 1] * rem + [base] * (4 - rem)
+        dirs = sorted(DIRECTIONS, key=lambda d: (len(groups[d]), random.random()))
+        i = 0
+        for d, k in zip(dirs, sorted(sizes, reverse=True)):
+            groups[d].update(c[i:i + k])
+            i += k
+    return groups
+
+
+def split_cells(cells, groups):
+    out = []
+    for cell in cells:
+        for d in DIRECTIONS:
+            part = [s for s in cell if s in groups[d]]
+            if part:
+                out.append(part)
+    return out
+
+
+class PinEntry4:
+    def __init__(self):
+        self.entered = []
+        self.reset_symbol()
+
+    def reset_symbol(self):
+        """(Re)start the current digit from round 1 with fresh partitions."""
+        self.cells = [SYMBOLS[:]]
+        self.vectors = {s: [] for s in SYMBOLS}
+        self.bits = []
+        self._new_round()
+
+    def _new_round(self):
+        self.groups = make_partition(self.cells)
+        for s in SYMBOLS:
+            for d in DIRECTIONS:
+                if s in self.groups[d]:
+                    self.vectors[s].append(d)
+                    break
+
+    def answer(self, direction):
+        """Returns 'round' | 'symbol' | 'done' | 'invalid'."""
+        self.bits.append(direction)
+        self.cells = split_cells(self.cells, self.groups)
+        if len(self.bits) == ROUNDS:
+            matches = [s for s in SYMBOLS if self.vectors[s] == self.bits]
+            if not matches:            # error self-detected: no digit fits
+                self.reset_symbol()
+                return "invalid"
+            self.entered.append(matches[0])
+            if len(self.entered) == PIN_LEN:
+                return "done"
+            self.reset_symbol()
+            return "symbol"
+        self._new_round()
+        return "round"
+
+    @property
+    def symbol_idx(self):
+        return len(self.entered)
+
+    @property
+    def round_idx(self):
+        return len(self.bits)
+
+
+def draw_board(canvas, entry, live, flash, armed):
+    """Fixed keypad + per-round direction badges + 4 edge command targets."""
+    # edge targets
+    tgt = {
+        "LEFT": ((40, 160), (170, 430), (105, 310), 3.0),
+        "RIGHT": ((790, 160), (920, 430), (855, 310), 3.0),
+        "UP": ((330, 128), (630, 160), (480, 153), 1.1),
+        "DOWN": ((330, 430), (630, 462), (480, 456), 1.1),
+    }
+    for d, (p0, p1, tp, sc) in tgt.items():
+        fl = (flash == d)
+        fill = tuple(int(c * 0.5 + f * 0.5) for c, f in zip(gp.PANEL, gp.OK_COLOR)) if fl else gp.PANEL
+        cv2.rectangle(canvas, p0, p1, fill, -1)
+        border = DIR_COLORS[d] if (live == d or fl) else (85, 85, 85)
+        cv2.rectangle(canvas, p0, p1, border, 3 if live == d else 1)
+        gp.put_center(canvas, DIR_GLYPH[d], tp[0], tp[1], sc, DIR_COLORS[d],
+                      4 if sc > 2 else 2, cv2.FONT_HERSHEY_DUPLEX)
+    # keypad frame doubles as the arming indicator
+    cv2.rectangle(canvas, (350, 168), (610, 423), gp.OK_COLOR if armed else (85, 85, 85),
+                  2 if armed else 1)
+    # fixed keypad with direction badges
+    for r, row in enumerate(KEYPAD):
+        for cidx, s in enumerate(row):
+            if s is None:
+                continue
+            cx, yc = KEY_CX[cidx], KEY_YC[r]
+            d = entry.vectors[s][-1] if entry.vectors[s] else "LEFT"
+            tint = tuple(int(p * 0.72 + a * 0.28) for p, a in zip(gp.PANEL, DIR_COLORS[d]))
+            cv2.rectangle(canvas, (cx - 36, yc - 27), (cx + 36, yc + 27), tint, -1)
+            cv2.rectangle(canvas, (cx - 36, yc - 27), (cx + 36, yc + 27), DIR_COLORS[d], 1)
+            gp.put_center(canvas, s, cx - 6, yc + 12, 1.0, gp.TXT, 2, cv2.FONT_HERSHEY_DUPLEX)
+            gp.put_center(canvas, DIR_GLYPH[d], cx + 22, yc - 8, 0.55, DIR_COLORS[d], 2)
 
 
 def main():
@@ -23,9 +161,9 @@ def main():
     ap.add_argument("--model", default="models/face_landmarker.task")
     args = ap.parse_args()
     pin = args.pin
-    if len(pin) != gp.PIN_LEN or any(ch not in gp.SYMBOLS for ch in pin):
-        raise SystemExit(f"PIN must be {gp.PIN_LEN} symbols from 1-8, got: {pin}")
-    print(f"[HeadPIN] demo PIN = {pin} (console only, never shown on screen)")
+    if len(pin) != PIN_LEN or any(ch not in SYMBOLS for ch in pin):
+        raise SystemExit(f"PIN must be {PIN_LEN} digits 0-9, got: {pin}")
+    print(f"[HeadPIN-4way] demo PIN = {pin} (console only, never shown on screen)")
 
     tracker = HeadTracker(args.model)
     cap = cv2.VideoCapture(args.source)
@@ -37,30 +175,28 @@ def main():
     state, cand, cand_n = "CENTER", None, 0
     prev_state = "CENTER"
     armed = False
-    center_frames = 0
     entry = None
     attempts = 0
     until = 0.0
     flash_side, flash_until = None, 0.0
     last_event = time.time()
     info, info_until = "", 0.0
-    undo_side, undo_frames = None, 0
     pending_at = None
+    closed_frames = 0
+    blink_latched = False
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         now = time.time()
-        st = tracker.update(frame)  # engine mirrors internally
+        st = tracker.update(frame)
         view = cv2.flip(frame, 1)
         if st.ok and st.bbox:
             cv2.rectangle(view, st.bbox[:2], st.bbox[2:], gp.OK_COLOR, 1)
 
-        # head direction -> debounced L/R/CENTER state (UP/DOWN unused here)
+        # debounced 4-way state
         raw = st.direction if st.ok else "CENTER"
-        if raw not in ("LEFT", "RIGHT"):
-            raw = "CENTER"
         if raw != state:
             if raw == cand:
                 cand_n += 1
@@ -71,15 +207,25 @@ def main():
         else:
             cand, cand_n = None, 0
 
-        # ---- app state machine (mirrors gazepin_demo) ----
+        # long-blink detector (cancel current digit)
+        long_blink = False
+        if st.ok and st.blink_score > 0.35:
+            closed_frames += 1
+            if closed_frames >= LONG_BLINK_FRAMES and not blink_latched:
+                long_blink = True
+                blink_latched = True
+        elif st.blink_score < 0.25:
+            closed_frames = 0
+            blink_latched = False
+
+        # ---- app state machine ----
         if app == "CALIB":
             if st.ok:
                 calib_frames += 1
             if calib_frames >= 15 and tracker.calibrate():
-                entry = gp.PinEntry()
+                entry = PinEntry4()
                 attempts = 0
                 armed = False
-                center_frames = 0
                 state = "CENTER"
                 last_event = now
                 app = "ENTER"
@@ -87,43 +233,40 @@ def main():
                 print("[calibrated] neutral head pose locked")
 
         elif app == "ENTER":
-            if state == "CENTER":
-                center_frames += 1
-            else:
-                center_frames = 0
-            if not armed and center_frames >= gp.ARM_FRAMES and pending_at is None:
+            if state == "CENTER" and pending_at is None:
                 armed = True
-            if armed and prev_state == "CENTER" and state in ("LEFT", "RIGHT") and pending_at is None:
+            if long_blink:
+                if pending_at is not None:
+                    pending_at = None
+                    entry.entered.pop()
+                    entry.reset_symbol()
+                    info, info_until = "Last digit cancelled - re-enter it", now + 2.5
+                    g.beep(500, 250)
+                    print("[blink] last digit cancelled")
+                elif entry.bits:
+                    entry.reset_symbol()
+                    info, info_until = "Digit rounds cancelled - restart this digit", now + 2.5
+                    g.beep(500, 250)
+                    print("[blink] current digit rounds cancelled")
+                last_event = now
+            elif armed and prev_state == "CENTER" and state in DIRECTIONS and pending_at is None:
                 armed = False
-                center_frames = 0
                 last_event = now
                 flash_side, flash_until = state, now + 0.35
-                undo_side, undo_frames = state, 0
-                res = entry.answer(state == "LEFT")
+                res = entry.answer(state)
                 print(f"[select] {state}  -> {res}")
                 if res == "round":
                     g.beep(1000, 70)
                 elif res == "symbol":
                     g.beep(700, 130)
+                elif res == "invalid":
+                    info, info_until = "Input error detected - digit restarted", now + 2.5
+                    g.beep(300, 300)
                 else:
                     g.beep(700, 130)
-                    pending_at = now + gp.FINAL_CHECK_DELAY
-            elif undo_side is not None:
-                if state == undo_side:
-                    undo_frames += 1
-                    if undo_frames >= gp.UNDO_HOLD_FRAMES:
-                        if entry.undo():
-                            pending_at = None
-                            info, info_until = "Selection cancelled - answer this round again", now + 2.5
-                            g.beep(500, 250)
-                            print("[undo] last selection cancelled")
-                        undo_side = None
-                        last_event = now
-                else:
-                    undo_side = None
+                    pending_at = now + FINAL_CHECK_DELAY
             if pending_at is not None and now >= pending_at:
                 pending_at = None
-                undo_side = None
                 if "".join(entry.entered) == pin:
                     app = "SUCCESS"
                     until = now + 4.0
@@ -131,17 +274,17 @@ def main():
                     print("[UNLOCKED]")
                 else:
                     attempts += 1
-                    print(f"[wrong PIN] attempt {attempts}/{gp.MAX_ATTEMPTS}")
-                    if attempts >= gp.MAX_ATTEMPTS:
+                    print(f"[wrong PIN] attempt {attempts}/{MAX_ATTEMPTS}")
+                    if attempts >= MAX_ATTEMPTS:
                         app = "LOCKOUT"
-                        until = now + gp.LOCKOUT_S
+                        until = now + LOCKOUT_S
                         g.beep(250, 700)
                     else:
                         app = "FAIL"
                         until = now + 2.5
                         g.beep(300, 400)
-            if now - last_event > gp.INACTIVITY_S and (entry.entered or entry.bits):
-                entry = gp.PinEntry()
+            if now - last_event > INACTIVITY_S and (entry.entered or entry.bits):
+                entry = PinEntry4()
                 info, info_until = "Timed out - entry restarted", now + 3.0
                 last_event = now
                 g.beep(300, 150)
@@ -150,35 +293,33 @@ def main():
             if now >= until:
                 if app == "SUCCESS":
                     attempts = 0
-                entry = gp.PinEntry()
+                entry = PinEntry4()
                 armed = False
-                undo_side, pending_at = None, None
+                pending_at = None
                 last_event = now
                 app = "ENTER"
 
         elif app == "LOCKOUT":
             if now >= until:
                 attempts = 0
-                entry = gp.PinEntry()
+                entry = PinEntry4()
                 armed = False
-                undo_side, pending_at = None, None
+                pending_at = None
                 last_event = now
                 app = "ENTER"
 
         prev_state = state
 
-        # ---- draw UI ----
+        # ---- draw ----
         canvas = np.full((H, W, 3), gp.BG, np.uint8)
-        gp.put(canvas, "HeadPIN Door Lock (head-turn input)", (30, 45), 0.9, gp.TXT, 2,
-               cv2.FONT_HERSHEY_DUPLEX)
-        gp.put(canvas, f"attempts {attempts}/{gp.MAX_ATTEMPTS}", (W - 180, 45), 0.55, gp.DIM)
+        gp.put(canvas, "HeadPIN 4-way Door Lock", (30, 45), 0.9, gp.TXT, 2, cv2.FONT_HERSHEY_DUPLEX)
+        gp.put(canvas, f"attempts {attempts}/{MAX_ATTEMPTS}", (W - 180, 45), 0.55, gp.DIM)
 
         if app == "CALIB":
             cv2.circle(canvas, (W // 2, 300), 14, gp.ACCENT["LEFT"], -1)
             cv2.circle(canvas, (W // 2, 300), 22, gp.ACCENT["LEFT"], 2)
             gp.put_center(canvas, "Face the camera squarely to calibrate", W // 2, 380, 0.8, gp.TXT, 2)
-            pct = min(100, int(100 * calib_frames / 15))
-            gp.put_center(canvas, f"{pct}%", W // 2, 420, 0.7, gp.DIM, 2)
+            gp.put_center(canvas, f"{min(100, int(100 * calib_frames / 15))}%", W // 2, 420, 0.7, gp.DIM, 2)
             if not st.ok:
                 gp.put_center(canvas, "NO FACE DETECTED", W // 2, 470, 0.7, gp.BAD_COLOR, 2)
         elif app == "SUCCESS":
@@ -190,7 +331,7 @@ def main():
             gp.put_center(canvas, "LOCKED OUT", W // 2, 320, 2.2, gp.BAD_COLOR, 5, cv2.FONT_HERSHEY_DUPLEX)
             gp.put_center(canvas, f"try again in {int(until - now) + 1}s", W // 2, 400, 0.9, gp.TXT, 2)
         else:
-            for i in range(gp.PIN_LEN):
+            for i in range(PIN_LEN):
                 cx = W // 2 - 90 + i * 60
                 if i < entry.symbol_idx:
                     cv2.circle(canvas, (cx, 85), 12, gp.OK_COLOR, -1)
@@ -198,52 +339,44 @@ def main():
                     cv2.circle(canvas, (cx, 85), 12, gp.DIM, 2)
                     if i == entry.symbol_idx:
                         cv2.circle(canvas, (cx, 85), 15, gp.TXT, 1)
-            for r in range(gp.ROUNDS):
-                cx = W // 2 - 30 + r * 30
+            for r in range(ROUNDS):
+                cx = W // 2 - 15 + r * 30
                 col = gp.OK_COLOR if r < entry.round_idx else gp.DIM
-                cv2.circle(canvas, (cx, 120), 6, col, -1 if r < entry.round_idx else 1)
+                cv2.circle(canvas, (cx, 113), 6, col, -1 if r < entry.round_idx else 1)
 
-            live = state if state in ("LEFT", "RIGHT") else None
+            live = state if state in DIRECTIONS else None
             fl = flash_side if now < flash_until else None
-            left_syms = [s for s in gp.SYMBOLS if s in entry.left]
-            right_syms = [s for s in gp.SYMBOLS if s not in entry.left]
-            gp.draw_entry_board(canvas, left_syms, right_syms, live, fl, armed, center_frames)
+            draw_board(canvas, entry, live, fl, armed)
 
-            if entry.symbol_idx >= gp.PIN_LEN:
-                gp.put_center(canvas, "Verifying...  (keep your head turned to cancel last selection)",
-                              W // 2, 470, 0.62, gp.TXT, 1)
+            if entry.symbol_idx >= PIN_LEN:
+                gp.put_center(canvas, "Verifying...  (long blink cancels the last digit)",
+                              W // 2, 490, 0.6, gp.TXT, 1)
             else:
-                step = f"Symbol {entry.symbol_idx + 1}/{gp.PIN_LEN}  round {entry.round_idx + 1}/{gp.ROUNDS}  -  "
+                step = f"Digit {entry.symbol_idx + 1}/{PIN_LEN}  round {entry.round_idx + 1}/{ROUNDS}  -  "
                 if armed:
-                    gp.put_center(canvas, step + "TURN YOUR HEAD toward the < or > on your digit's side",
-                                  W // 2, 470, 0.62, gp.OK_COLOR, 1)
+                    gp.put_center(canvas, step + "turn your head toward your digit's arrow  |  long blink = redo digit",
+                                  W // 2, 490, 0.58, gp.OK_COLOR, 1)
                 else:
-                    gp.put_center(canvas, step + "find your digit, then face forward",
-                                  W // 2, 470, 0.62, gp.TXT, 1)
-            if undo_side is not None and undo_frames > 8:
-                frac = min(1.0, undo_frames / gp.UNDO_HOLD_FRAMES)
-                cv2.rectangle(canvas, (W // 2 - 120, 486), (W // 2 + 120, 500), (70, 70, 70), 1)
-                cv2.rectangle(canvas, (W // 2 - 120, 486),
-                              (W // 2 - 120 + int(240 * frac), 500), (80, 200, 255), -1)
-                gp.put_center(canvas, "hold to UNDO", W // 2, 520, 0.5, (80, 200, 255), 1)
-            elif not armed and state != "CENTER":
-                gp.put_center(canvas, "face forward...", W // 2, 500, 0.55, gp.DIM, 1)
+                    gp.put_center(canvas, step + "face forward to arm", W // 2, 490, 0.58, gp.TXT, 1)
 
-        # head-yaw meter
+        # 2D head joystick pad
         if st.ok and app in ("ENTER", "FAIL"):
-            cx, my = 300, 560
-            cv2.line(canvas, (cx - 150, my), (cx + 150, my), (90, 90, 90), 2)
-            for t in (-tracker.thr_deg, tracker.thr_deg):
-                tx = cx + int(np.clip(t, -30, 30) / 30 * 150)
-                cv2.line(canvas, (tx, my - 8), (tx, my + 8), gp.DIM, 1)
-            px = cx + int(np.clip(st.yaw, -30, 30) / 30 * 150)
-            col = gp.ACCENT.get(state, gp.OK_COLOR)
-            cv2.circle(canvas, (px, my), 8, col, -1)
-            gp.put(canvas, f"{state}  yaw {st.yaw:+.0f}", (cx - 150, my + 35), 0.55, col, 2)
+            px0, py0, sz = 80, 495, 150
+            cv2.rectangle(canvas, (px0, py0), (px0 + sz, py0 + sz), (70, 70, 70), 1)
+            cv2.line(canvas, (px0 + sz // 2, py0), (px0 + sz // 2, py0 + sz), (55, 55, 55), 1)
+            cv2.line(canvas, (px0, py0 + sz // 2), (px0 + sz, py0 + sz // 2), (55, 55, 55), 1)
+            jx = px0 + sz // 2 - int(np.clip(st.yaw, -25, 25) / 25 * (sz // 2 - 6))   # +yaw = LEFT
+            jy = py0 + sz // 2 - int(np.clip(st.pitch, -25, 25) / 25 * (sz // 2 - 6))  # +pitch = UP
+            col = DIR_COLORS.get(state, gp.OK_COLOR)
+            cv2.circle(canvas, (jx, jy), 7, col, -1)
+            gp.put(canvas, f"{state}", (px0, py0 + sz + 22), 0.55, col, 2)
+            if closed_frames > 4:
+                gp.put(canvas, f"blink {min(closed_frames, LONG_BLINK_FRAMES)}/{LONG_BLINK_FRAMES}",
+                       (px0, py0 - 10), 0.5, (80, 200, 255), 1)
 
         if now < info_until:
             gp.put_center(canvas, info, W // 2, 615, 0.6, (80, 200, 255), 2)
-        gp.put(canvas, "c=recalibrate  r=restart  x=flip-yaw  q=quit", (30, H - 20), 0.5, gp.DIM)
+        gp.put(canvas, "c=recalibrate  r=restart  x=flip-yaw  q=quit", (300, H - 20), 0.5, gp.DIM)
 
         inset = cv2.resize(view, (240, 180))
         canvas[H - 200:H - 20, W - 260:W - 20] = inset
@@ -261,8 +394,8 @@ def main():
             tracker.flip_yaw()
             print("[yaw sign flipped]")
         elif k == ord('r') and app == "ENTER":
-            entry = gp.PinEntry()
-            undo_side, pending_at = None, None
+            entry = PinEntry4()
+            pending_at = None
             info, info_until = "Entry restarted", now + 2.0
             last_event = now
 
