@@ -44,6 +44,7 @@ class HeadState:
     blink_score: float = 0.0       # 0(뜸)~1(감김)
     face_px: int = 0               # 얼굴 폭 픽셀 (거리 추정용)
     bbox: tuple = field(default=None)  # (x0, y0, x1, y1) 또는 None
+    landmarks: list = field(default=None)  # 정규화 얼굴 랜드마크 478개 (마스크 감지 등)
 
 
 class HeadTracker:
@@ -130,6 +131,7 @@ class HeadTracker:
         if not res.face_landmarks:
             return st
         st.ok = True
+        st.landmarks = res.face_landmarks[0]
 
         # 깜빡임 (양눈 min + 이중 문턱)
         shapes = {c.category_name: c.score for c in res.face_blendshapes[0]}

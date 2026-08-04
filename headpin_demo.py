@@ -37,6 +37,15 @@ STABLE_TOL = 0.02        # bbox-center wander tolerance (fraction of frame width
 JUMP_TOL = 0.012         # per-frame movement that restarts calibration
 CALIB_FRAMES = 18
 FACE_LOST_RESET_S = 2.0  # visitor gone this long during entry -> session reset
+# mask detection (decided ONCE per session, during the hold-still window):
+# masked -> DOWN gestures are unreliable, switch to 3 directions / 3 rounds
+LOWER_IDS = [0, 13, 14, 17, 152, 200]      # lips / chin landmarks
+UPPER_IDS = [33, 133, 263, 362, 159, 386]  # eye-region landmarks
+MASK_COLOR_DIST = 43.0    # glabella vs philtrum mean-HSV distance
+# (measured: bare face 22-31, masked 56-88 -> threshold at the gap midpoint.
+#  landmark jitter proved non-discriminative and is logged for info only)
+MASKED_DIRS = ["LEFT", "RIGHT", "UP"]
+MASKED_ROUNDS = 3         # ceil(log3(10))
 
 DIR_COLORS = {
     "LEFT": (80, 200, 255),   # orange
@@ -55,30 +64,32 @@ KEY_CX = {0: 400, 1: 480, 2: 560}
 KEY_YC = [200, 263, 326, 389]
 
 
-def make_partition(cells):
-    """Assign every symbol to one of 4 directions; split each cell as evenly as
-    possible, balancing group sizes. Uses only public state + randomness."""
-    groups = {d: set() for d in DIRECTIONS}
+def make_partition(cells, dirs=None):
+    """Assign every symbol to one of the active directions; split each cell as
+    evenly as possible, balancing group sizes. Uses only public state + randomness."""
+    dirs = dirs or DIRECTIONS
+    groups = {d: set() for d in dirs}
     order = cells[:]
     random.shuffle(order)
     for cell in order:
         c = list(cell)
         random.shuffle(c)
         s = len(c)
-        base, rem = divmod(s, 4)
-        sizes = [base + 1] * rem + [base] * (4 - rem)
-        dirs = sorted(DIRECTIONS, key=lambda d: (len(groups[d]), random.random()))
+        base, rem = divmod(s, len(dirs))
+        sizes = [base + 1] * rem + [base] * (len(dirs) - rem)
+        ordered = sorted(dirs, key=lambda d: (len(groups[d]), random.random()))
         i = 0
-        for d, k in zip(dirs, sorted(sizes, reverse=True)):
+        for d, k in zip(ordered, sorted(sizes, reverse=True)):
             groups[d].update(c[i:i + k])
             i += k
     return groups
 
 
-def split_cells(cells, groups):
+def split_cells(cells, groups, dirs=None):
+    dirs = dirs or DIRECTIONS
     out = []
     for cell in cells:
-        for d in DIRECTIONS:
+        for d in dirs:
             part = [s for s in cell if s in groups[d]]
             if part:
                 out.append(part)
@@ -86,7 +97,9 @@ def split_cells(cells, groups):
 
 
 class PinEntry4:
-    def __init__(self):
+    def __init__(self, dirs=None, rounds=None):
+        self.dirs = list(dirs or DIRECTIONS)
+        self.rounds = rounds or ROUNDS
         self.entered = []
         self.reset_symbol()
 
@@ -98,9 +111,9 @@ class PinEntry4:
         self._new_round()
 
     def _new_round(self):
-        self.groups = make_partition(self.cells)
+        self.groups = make_partition(self.cells, self.dirs)
         for s in SYMBOLS:
-            for d in DIRECTIONS:
+            for d in self.dirs:
                 if s in self.groups[d]:
                     self.vectors[s].append(d)
                     break
@@ -108,8 +121,8 @@ class PinEntry4:
     def answer(self, direction):
         """Returns 'round' | 'symbol' | 'done' | 'invalid'."""
         self.bits.append(direction)
-        self.cells = split_cells(self.cells, self.groups)
-        if len(self.bits) == ROUNDS:
+        self.cells = split_cells(self.cells, self.groups, self.dirs)
+        if len(self.bits) == self.rounds:
             matches = [s for s in SYMBOLS if self.vectors[s] == self.bits]
             if not matches:            # error self-detected: no digit fits
                 self.reset_symbol()
@@ -131,8 +144,9 @@ class PinEntry4:
         return len(self.bits)
 
 
-def draw_board(canvas, entry, live, flash, armed):
-    """Fixed keypad + per-round direction badges + 4 edge command targets."""
+def draw_board(canvas, entry, live, flash, armed, dirs=None):
+    """Fixed keypad + per-round direction badges + edge command targets."""
+    dirs = dirs or DIRECTIONS
     # edge targets
     tgt = {
         "LEFT": ((40, 160), (170, 430), (105, 310), 3.0),
@@ -141,6 +155,8 @@ def draw_board(canvas, entry, live, flash, armed):
         "DOWN": ((330, 430), (630, 462), (480, 456), 1.1),
     }
     for d, (p0, p1, tp, sc) in tgt.items():
+        if d not in dirs:
+            continue
         fl = (flash == d)
         fill = tuple(int(c * 0.5 + f * 0.5) for c, f in zip(gp.PANEL, gp.OK_COLOR)) if fl else gp.PANEL
         cv2.rectangle(canvas, p0, p1, fill, -1)
@@ -164,6 +180,41 @@ def draw_board(canvas, entry, live, flash, armed):
             gp.put_center(canvas, s, cx - 6, yc + 12, 1.0, gp.TXT, 2, cv2.FONT_HERSHEY_DUPLEX)
             gp.put_center(canvas, DIR_GLYPH[d], cx + 22, yc - 6, 0.7, DIR_COLORS[d], 2,
                           cv2.FONT_HERSHEY_DUPLEX)
+
+
+def _region_hist(img, x0, y0, x1, y1):
+    roi = img[max(0, y0):max(0, y1), max(0, x0):max(0, x1)]
+    if roi.size == 0:
+        return None
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist
+
+
+def mask_color_score(view, landmarks, face_px):
+    """Mean-HSV distance between two landmark-anchored patches:
+    glabella (between the eyebrows - always skin) vs philtrum (fabric when
+    masked). Mean color is robust where tiny-patch histograms are pure noise.
+    Returns (distance, up_hsv, lo_hsv) or None."""
+    h, w = view.shape[:2]
+    r = max(8, int(face_px * 0.12))
+
+    def patch_mean(idx):
+        cx, cy = int(landmarks[idx].x * w), int(landmarks[idx].y * h)
+        roi = view[max(0, cy - r):cy + r, max(0, cx - r):cx + r]
+        if roi.size == 0:
+            return None
+        return cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).reshape(-1, 3).mean(axis=0)
+
+    up = patch_mean(168)   # glabella
+    lo = patch_mean(164)   # philtrum
+    if up is None or lo is None:
+        return None
+    dh = min(abs(up[0] - lo[0]), 180 - abs(up[0] - lo[0])) * 2.0  # circular hue
+    ds = abs(up[1] - lo[1])
+    dv = abs(up[2] - lo[2])
+    return float(dh + ds + 0.5 * dv), up, lo
 
 
 def main():
@@ -191,6 +242,11 @@ def main():
     grace_until = 0.0
     face_lost_at = None
     wait_close = False
+    masked = False
+    active_dirs = list(DIRECTIONS)
+    active_rounds = ROUNDS
+    mask_low, mask_up, mask_bhat = [], [], []
+    mask_patches = None
     state, cand, cand_n = "CENTER", None, 0
     prev_state = "CENTER"
     armed = False
@@ -214,8 +270,11 @@ def main():
         if st.ok and st.bbox:
             cv2.rectangle(view, st.bbox[:2], st.bbox[2:], gp.OK_COLOR, 1)
 
-        # debounced 4-way state
+        # debounced state (directions outside the active set are ignored,
+        # e.g. DOWN in mask mode)
         raw = st.direction if st.ok else "CENTER"
+        if raw != "CENTER" and raw not in active_dirs:
+            raw = "CENTER"
         if raw != state:
             if raw == cand:
                 cand_n += 1
@@ -256,7 +315,7 @@ def main():
                     app = "WAIT"
                     centers.clear()
                     tracker.reset_calibration()
-                    entry = PinEntry4()
+                    entry = PinEntry4(active_dirs, active_rounds)
                     armed = False
                     pending_at = None
                     face_lost_at = None
@@ -274,6 +333,7 @@ def main():
             if wait_close and stable:
                 app = "CALIB"
                 calib_frames = 0
+                mask_low, mask_up, mask_bhat = [], [], []
                 grace_until = now + 0.6
                 g.beep(600, 80)
                 print("[presence] visitor standing still - starting calibration")
@@ -283,6 +343,15 @@ def main():
                 app = "WAIT"
                 centers.clear()
             else:
+                # collect mask-detection evidence during the hold-still window
+                if st.landmarks is not None:
+                    mask_low.append([(st.landmarks[i].x, st.landmarks[i].y) for i in LOWER_IDS])
+                    mask_up.append([(st.landmarks[i].x, st.landmarks[i].y) for i in UPPER_IDS])
+                if st.landmarks is not None and st.face_px:
+                    cs = mask_color_score(view, st.landmarks, st.face_px)
+                    if cs is not None:
+                        mask_bhat.append(cs[0])
+                        mask_patches = (cs[1], cs[2])
                 moved = (len(centers) >= 2
                          and (abs(centers[-1][0] - centers[-2][0]) > JUMP_TOL
                               or abs(centers[-1][1] - centers[-2][1]) > JUMP_TOL))
@@ -291,7 +360,27 @@ def main():
                 elif now >= grace_until:
                     calib_frames += 1
                 if calib_frames >= CALIB_FRAMES and tracker.calibrate():
-                    entry = PinEntry4()
+                    # decide mask mode ONCE per session
+                    ratio, bhat = 0.0, 0.0
+                    if len(mask_low) >= 8:
+                        low = np.array(mask_low)
+                        up = np.array(mask_up)
+                        jl = float(np.mean(np.std(low, axis=0)))
+                        ju = float(np.mean(np.std(up, axis=0)))
+                        ratio = jl / max(ju, 1e-6)
+                    if mask_bhat:
+                        bhat = float(np.median(mask_bhat))
+                    # landmark-anchored mean-color distance is the sole signal
+                    masked = bhat > MASK_COLOR_DIST
+                    active_dirs = list(MASKED_DIRS) if masked else list(DIRECTIONS)
+                    active_rounds = MASKED_ROUNDS if masked else ROUNDS
+                    print(f"[mask] jitter_ratio={ratio:.2f} color_dist={bhat:.1f} -> "
+                          f"{'MASKED: 3-way mode' if masked else 'no mask: 4-way mode'}")
+                    if mask_patches:
+                        u, l = mask_patches
+                        print(f"[mask-debug] glabella HSV=({u[0]:.0f},{u[1]:.0f},{u[2]:.0f}) "
+                              f"philtrum HSV=({l[0]:.0f},{l[1]:.0f},{l[2]:.0f})")
+                    entry = PinEntry4(active_dirs, active_rounds)
                     attempts = 0
                     armed = False
                     state = "CENTER"
@@ -353,7 +442,7 @@ def main():
                         until = now + 2.5
                         g.beep(300, 400)
             if now - last_event > INACTIVITY_S and (entry.entered or entry.bits):
-                entry = PinEntry4()
+                entry = PinEntry4(active_dirs, active_rounds)
                 info, info_until = "Timed out - entry restarted", now + 3.0
                 last_event = now
                 g.beep(300, 150)
@@ -383,7 +472,7 @@ def main():
         elif app in ("SUCCESS", "DECLINED"):
             if now >= until:
                 attempts = 0
-                entry = PinEntry4()
+                entry = PinEntry4(active_dirs, active_rounds)
                 armed = False
                 pending_at = None
                 centers.clear()
@@ -393,7 +482,7 @@ def main():
 
         elif app == "FAIL":
             if now >= until:
-                entry = PinEntry4()
+                entry = PinEntry4(active_dirs, active_rounds)
                 armed = False
                 pending_at = None
                 last_event = now
@@ -402,7 +491,7 @@ def main():
         elif app == "LOCKOUT":
             if now >= until:
                 attempts = 0
-                entry = PinEntry4()
+                entry = PinEntry4(active_dirs, active_rounds)
                 armed = False
                 pending_at = None
                 last_event = now
@@ -490,22 +579,34 @@ def main():
                     gp.put_center(canvas, "*", x0 + slot_w // 2, y0 + 45, 1.4, gp.OK_COLOR, 3,
                                   cv2.FONT_HERSHEY_DUPLEX)
                 elif i == entry.symbol_idx:
-                    for k in range(ROUNDS):
-                        hx0 = x0 + k * (slot_w // ROUNDS)
+                    for k in range(entry.rounds):
+                        hx0 = x0 + k * (slot_w // entry.rounds)
                         filled = k < entry.round_idx
                         cv2.rectangle(canvas, (hx0 + 3, y0 + 3),
-                                      (hx0 + slot_w // ROUNDS - 3, y0 + slot_h - 3),
+                                      (hx0 + slot_w // entry.rounds - 3, y0 + slot_h - 3),
                                       gp.OK_COLOR if filled else gp.PANEL, -1)
                     cv2.rectangle(canvas, (x0, y0), (x0 + slot_w, y0 + slot_h), gp.TXT, 2)
                 else:
                     cv2.rectangle(canvas, (x0, y0), (x0 + slot_w, y0 + slot_h), gp.PANEL, -1)
                     cv2.rectangle(canvas, (x0, y0), (x0 + slot_w, y0 + slot_h), (85, 85, 85), 1)
-            gp.put(canvas, "2 turns", (W // 2 + 180, 82), 0.5, gp.DIM, 1)
+            gp.put(canvas, f"{entry.rounds} turns", (W // 2 + 180, 82), 0.5, gp.DIM, 1)
             gp.put(canvas, "= 1 digit", (W // 2 + 180, 104), 0.5, gp.DIM, 1)
+            if masked:
+                gp.put(canvas, "MASK MODE - 3 directions", (30, 70), 0.55, gp.ACCENT["LEFT"], 2)
 
             live = state if state in DIRECTIONS else None
             fl = flash_side if now < flash_until else None
-            draw_board(canvas, entry, live, fl, armed)
+            draw_board(canvas, entry, live, fl, armed, active_dirs)
+
+            # mini head cursor over the keypad: shows where the head turn is
+            # being read, right where the user is already looking
+            if st.ok:
+                mcx, mcy = 480, 296
+                mx = mcx - int(np.clip(st.yaw, -25, 25) / 25 * 95)    # +yaw = LEFT
+                my_ = mcy - int(np.clip(st.pitch, -25, 25) / 25 * 95)  # +pitch = UP
+                mcol = DIR_COLORS.get(state, (200, 200, 200))
+                cv2.circle(canvas, (mx, my_), 5, mcol, -1)
+                cv2.circle(canvas, (mx, my_), 8, mcol, 1)
 
             if entry.symbol_idx >= PIN_LEN:
                 gp.put_center(canvas, "Verifying...  (long blink cancels the last digit)",
@@ -552,7 +653,7 @@ def main():
             tracker.flip_yaw()
             print("[yaw sign flipped]")
         elif k == ord('r') and app == "ENTER":
-            entry = PinEntry4()
+            entry = PinEntry4(active_dirs, active_rounds)
             pending_at = None
             info, info_until = "Entry restarted", now + 2.0
             last_event = now
