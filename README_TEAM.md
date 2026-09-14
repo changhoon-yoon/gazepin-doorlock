@@ -1,7 +1,7 @@
 # GazePIN / HeadPIN 도어락 데모 — 팀원용 안내
 
 시선(또는 고개 제스처)만으로 비밀번호를 입력하는 어깨너머 방어 도어락 프로토타입.
-ESW 경진대회 준비용. 설계 근거와 보안 분석은 `doorlock_pin_design.md` 참고.
+개인 프로젝트(2026-08)로 만든 프로토타입. 설계 근거와 보안 분석은 `doorlock_pin_design.md` 참고.
 
 ## 준비물
 - Windows + 웹캠
